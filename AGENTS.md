@@ -1,0 +1,31 @@
+# Agent 安装指南
+
+这份文件供帮助人类用户在其 **macOS 本机**安装“豆包语音切换”的 Agent 使用。仓库地址：`https://github.com/yxzlwz/doubao-voice-switcher`。
+
+## 先确认快捷键
+
+**先问人类：你是否更改了豆包输入法默认的语音输入快捷键？目前在豆包设置里，按住说话是否仍是 Fn + Control，点按开关是否仍是右 Option？**
+
+可以同时检查本机环境，但必须得到回答后再选择安装方式。当前源码写死了这两种快捷键。如果人类改过，先询问实际设置；请他们改回这两种快捷键，或按其明确意愿修改 `main.mm` 并从源码构建。不要直接安装现成 Release 后声称自定义快捷键可用。
+
+## 安装
+
+1. 确认是 macOS，已安装并启用豆包输入法。获取本仓库源码。Release 中的 `doubao-voice-switcher-macos-unsigned.zip` 是**未签名**应用，不能直接当作已安装版本运行。
+2. 优先选择适合用户环境的方式：
+   - **从源码**：需要 Xcode Command Line Tools；在仓库目录运行 `./install.sh`。它调用 `build.sh` 生成未签名应用，再调用 `sign-local.sh` 在本机签名并安装。
+   - **从 Release**：下载官方 Release 压缩包，在本机解压；仍需本仓库的安装脚本。在仓库目录运行 `./install.sh --app '/绝对路径/豆包语音切换.app'`。安装脚本会先在本机签名这份应用，再复制到 `~/Applications`。
+3. `sign-local.sh` 首次调用 `setup-signing.sh`，把自签名证书、私钥和独立钥匙串保存在 `~/Library/Application Support/DoubaoVoiceSwitcher/`。**不要上传、提交、打印或发送这些文件及钥匙串密码。** 后续安装复用同一身份，以便 macOS 保留权限记录。
+4. 检查已安装应用：`codesign --verify --strict "$HOME/Applications/豆包语音切换.app"`；确认 `pgrep -fl DoubaoVoiceSwitcher` 能看到该应用。用户登录时通过 LaunchAgent 自动启动。
+5. 请人类亲自在“系统设置 → 隐私与安全性”给**已安装的应用**授予“辅助功能”和“输入监控”权限。Agent 不要绕过系统授权。如果菜单显示监听未获权限，用户授权后点菜单中的“重新连接键盘监听”；必要时退出并重启应用。
+6. 如果 macOS 因应用未公证而阻止从 Release 启动，请人类在系统设置的安全提示里选择“仍要打开”。不要自动移除隔离属性或绕过系统确认。
+
+## 配置与验收
+
+- 在“系统设置 → 键盘”中，单按 Fn 切系统中英文功能要求人类把“按下 Fn 键时”设为“不执行任何操作”，避免与 macOS 自带切换重复。不要替人类擅自修改该设置；也可以在本工具菜单里关闭单按 Fn 功能。
+- 右 Option 首次触发依赖 macOS 的“选择输入法菜单中的下一个输入法”快捷键，默认 **Control + Option + 空格**。先确认它已启用且未改键；本程序目前发送的是默认组合。不要擅自修改系统快捷键。
+- 在文本输入框中分别验证：按住 Fn + Control 开始语音、松开结束；点按右 Option 开始、再次点按停止；输入法最终恢复。若豆包只切换却不录音，先核对豆包内部快捷键、系统输入法切换快捷键和菜单状态，再根据本机情况排查。不要把“输入法已切换”当作“语音已启动”的证据。
+- `./build.sh` 只生成**未签名**应用；`./sign-local.sh [应用路径]` 只做本机签名；`./uninstall.sh` 移除登录项与已安装应用，但保留本机签名身份。不要把本机签名后的应用上传到 Release。
+
+## 发布约束
+
+Git 仓库只包含源码、脚本和文档。Release 压缩包必须由 `./build.sh` 的未签名输出生成；打包前执行 `codesign -dv 'build/豆包语音切换.app'`，确认结果为 `code object is not signed at all`。不得打包 `_CodeSignature`、本机钥匙串、证书、私钥或密码。
