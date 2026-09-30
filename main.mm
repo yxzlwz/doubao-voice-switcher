@@ -6,11 +6,17 @@
 #include <unistd.h>
 
 static NSString *const kDoubaoSourceID = @"com.bytedance.inputmethod.doubaoime.pinyin";
-static NSString *const kNativeChineseID = @"com.apple.inputmethod.SCIM.Shuangpin";
-static NSString *const kNativeEnglishID = @"com.apple.keylayout.US";
+static NSString *const kNativeShuangpinID = @"com.apple.inputmethod.SCIM.Shuangpin";
+static NSString *const kNativePinyinID = @"com.apple.inputmethod.SCIM.Pinyin";
+static NSString *const kNativeUSID = @"com.apple.keylayout.US";
+static NSString *const kNativeABCID = @"com.apple.keylayout.ABC";
 static constexpr NSTimeInterval kDefaultRestoreDelay = 1.2;
 static constexpr useconds_t kInputSourceActivationDelayUs = 150000;
 static constexpr uint64_t kSyntheticRightOptionTag = 0x4442564f5054494f;
+static constexpr NSTimeInterval kFocusBounceDelay = 0.18;
+static constexpr NSTimeInterval kFocusSettleDelay = 0.5;
+static constexpr NSTimeInterval kRightOptionTapDuration = 0.15;
+static constexpr NSTimeInterval kStatusHideDelay = 10.0;
 
 enum class VoiceTrigger { None, FnControl, RightOption };
 static NSString *const kReadyTitle = @"待命：按住 Fn + Control，或按右 Option";
@@ -37,6 +43,26 @@ static TISInputSourceRef findSource(NSString *identifier) {
     return result;
 }
 
+static BOOL isNativeChineseID(NSString *identifier) {
+    return [identifier isEqualToString:kNativeShuangpinID] || [identifier isEqualToString:kNativePinyinID];
+}
+
+static BOOL isNativeEnglishID(NSString *identifier) {
+    return [identifier isEqualToString:kNativeUSID] || [identifier isEqualToString:kNativeABCID];
+}
+
+static TISInputSourceRef findPreferredSource(NSString *savedID, NSArray<NSString *> *candidates) {
+    if (savedID && [candidates containsObject:savedID]) {
+        TISInputSourceRef saved = findSource(savedID);
+        if (saved) return saved;
+    }
+    for (NSString *identifier in candidates) {
+        TISInputSourceRef source = findSource(identifier);
+        if (source) return source;
+    }
+    return nullptr;
+}
+
 static void postKey(CGEventSourceRef source, CGKeyCode key, bool down, CGEventFlags flags) {
     CGEventRef event = CGEventCreateKeyboardEvent(source, key, down);
     if (!event) return;
@@ -45,33 +71,32 @@ static void postKey(CGEventSourceRef source, CGKeyCode key, bool down, CGEventFl
     CFRelease(event);
 }
 
-static void postNextInputSourceShortcut() {
-    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-    postKey(source, kVK_Control, true, kCGEventFlagMaskControl);
-    usleep(30000);
-    postKey(source, kVK_Option, true, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate);
-    usleep(30000);
-    postKey(source, kVK_Space, true, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate);
-    usleep(40000);
-    postKey(source, kVK_Space, false, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate);
-    usleep(25000);
-    postKey(source, kVK_Option, false, kCGEventFlagMaskControl);
-    postKey(source, kVK_Control, false, 0);
-    if (source) CFRelease(source);
+static void postNextInputSourceShortcut(void (^completion)(void)) {
+    postKey(nullptr, kVK_Control, true, kCGEventFlagMaskControl);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40000000), dispatch_get_main_queue(), ^{
+        postKey(nullptr, kVK_Option, true, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40000000), dispatch_get_main_queue(), ^{
+            postKey(nullptr, kVK_Space, true, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50000000), dispatch_get_main_queue(), ^{
+                postKey(nullptr, kVK_Space, false, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30000000), dispatch_get_main_queue(), ^{
+                    postKey(nullptr, kVK_Option, false, kCGEventFlagMaskControl);
+                    postKey(nullptr, kVK_Control, false, 0);
+                    completion();
+                });
+            });
+        });
+    });
 }
 
-static void postRightOptionTap() {
+static void postRightOptionEvent(bool down) {
     CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-    for (int phase = 0; phase < 2; ++phase) {
-        bool down = phase == 0;
-        CGEventRef event = CGEventCreateKeyboardEvent(source, kVK_RightOption, down);
-        if (!event) continue;
-        CGEventSetType(event, kCGEventFlagsChanged);
+    CGEventRef event = CGEventCreateKeyboardEvent(source, kVK_RightOption, down);
+    if (event) {
         CGEventSetFlags(event, down ? (kCGEventFlagMaskAlternate | NX_DEVICERALTKEYMASK) : 0);
         CGEventSetIntegerValueField(event, kCGEventSourceUserData, kSyntheticRightOptionTag);
         CGEventPost(kCGHIDEventTap, event);
         CFRelease(event);
-        if (down) usleep(70000);
     }
     if (source) CFRelease(source);
 }
@@ -95,11 +120,15 @@ static void postRightOptionTap() {
     BOOL _fnCandidate;
     TISInputSourceRef _previous;
     NSTimer *_restoreTimer;
+    NSTimer *_statusHideTimer;
     BOOL _chordDown;
     VoiceTrigger _voiceTrigger;
     BOOL _rightOptionPending;
     BOOL _rightOptionWaitingForRelease;
+    BOOL _focusBounceComplete;
     BOOL _switched;
+    NSRunningApplication *_frontmostApp;
+    AXUIElementRef _focusedWindow;
 }
 
 static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef event, void *context) {
@@ -172,8 +201,11 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
     _doubao = findSource(kDoubaoSourceID);
-    _nativeChinese = findSource(kNativeChineseID);
-    _nativeEnglish = findSource(kNativeEnglishID);
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    _nativeChinese = findPreferredSource([defaults stringForKey:@"nativeChineseID"],
+                                        @[kNativeShuangpinID, kNativePinyinID]);
+    _nativeEnglish = findPreferredSource([defaults stringForKey:@"nativeEnglishID"],
+                                        @[kNativeUSID, kNativeABCID]);
     _fnToggleEnabled = [[NSUserDefaults standardUserDefaults] objectForKey:@"fnToggleEnabled"] ?
                        [[NSUserDefaults standardUserDefaults] boolForKey:@"fnToggleEnabled"] : YES;
     _restoreDelay = [[NSUserDefaults standardUserDefaults] doubleForKey:@"restoreDelay"] ?: kDefaultRestoreDelay;
@@ -214,6 +246,27 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     [menu addItem:quit];
     _status.menu = menu;
     [self startTap];
+    if (_tap) _status.visible = NO;
+}
+
+- (void)showStatus {
+    [_statusHideTimer invalidate];
+    _statusHideTimer = nil;
+    _status.visible = YES;
+}
+
+- (void)hideStatus {
+    _statusHideTimer = nil;
+    if (_voiceTrigger == VoiceTrigger::None && !_rightOptionPending) _status.visible = NO;
+}
+
+- (void)scheduleStatusHide {
+    [_statusHideTimer invalidate];
+    _statusHideTimer = [NSTimer timerWithTimeInterval:kStatusHideDelay
+                                              target:self
+                                            selector:@selector(hideStatus)
+                                            userInfo:nil repeats:NO];
+    [[NSRunLoop mainRunLoop] addTimer:_statusHideTimer forMode:NSRunLoopCommonModes];
 }
 
 - (void)startTap {
@@ -225,6 +278,7 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     if (_tap) {
         CGEventTapEnable(_tap, true);
         _stateItem.title = kReadyTitle;
+        [self scheduleStatusHide];
         return;
     }
     _tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
@@ -241,17 +295,27 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     CFRunLoopAddSource(CFRunLoopGetMain(), _tapSource, kCFRunLoopCommonModes);
     CGEventTapEnable(_tap, true);
     _stateItem.title = kReadyTitle;
+    [self scheduleStatusHide];
     NSLog(@"键盘监听已启动");
 }
 
 - (void)toggleNativeInputSource {
     if (!_nativeChinese || !_nativeEnglish) {
-        _stateItem.title = @"缺少系统简体双拼或美式英文输入法";
+        _stateItem.title = @"缺少系统拼音或英文输入法";
         return;
     }
     TISInputSourceRef current = TISCopyCurrentKeyboardInputSource();
     NSString *currentID = sourceID(current);
-    TISInputSourceRef target = [currentID isEqualToString:kNativeChineseID] ? _nativeEnglish : _nativeChinese;
+    if (isNativeChineseID(currentID) && ![currentID isEqualToString:sourceID(_nativeChinese)]) {
+        CFRelease(_nativeChinese);
+        _nativeChinese = (TISInputSourceRef)CFRetain(current);
+        [[NSUserDefaults standardUserDefaults] setObject:currentID forKey:@"nativeChineseID"];
+    } else if (isNativeEnglishID(currentID) && ![currentID isEqualToString:sourceID(_nativeEnglish)]) {
+        CFRelease(_nativeEnglish);
+        _nativeEnglish = (TISInputSourceRef)CFRetain(current);
+        [[NSUserDefaults standardUserDefaults] setObject:currentID forKey:@"nativeEnglishID"];
+    }
+    TISInputSourceRef target = isNativeChineseID(currentID) ? _nativeEnglish : _nativeChinese;
     OSStatus result = TISSelectInputSource(target);
     if (result != noErr) {
         NSLog(@"切换系统中英文失败：%d", (int)result);
@@ -273,6 +337,7 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     [_restoreTimer invalidate];
     _restoreTimer = nil;
     if (_switched) {
+        [self showStatus];
         _stateItem.title = [NSString stringWithFormat:@"语音输入中 · 将返回 %@", sourceName(_previous)];
         return NO;
     }
@@ -288,10 +353,12 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     OSStatus result = TISSelectInputSource(_doubao);
     if (result == noErr) {
         _switched = YES;
+        [self showStatus];
         _stateItem.title = [NSString stringWithFormat:@"语音输入中 · 将返回 %@", sourceName(_previous)];
         return YES;
     } else {
         NSLog(@"切换豆包输入法失败：%d", (int)result);
+        [self showStatus];
         _stateItem.title = @"切换豆包失败，请检查输入法设置";
         CFRelease(_previous);
         _previous = nullptr;
@@ -304,6 +371,7 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
         [_restoreTimer invalidate];
         _restoreTimer = nil;
         _voiceTrigger = VoiceTrigger::RightOption;
+        [self showStatus];
         _stateItem.title = [NSString stringWithFormat:@"语音输入中 · 将返回 %@", sourceName(_previous)];
         return NO;
     }
@@ -315,28 +383,86 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     }
     if (_previous) CFRelease(_previous);
     _previous = current;
+    _frontmostApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    if (_focusedWindow) CFRelease(_focusedWindow);
+    _focusedWindow = nullptr;
     _rightOptionPending = YES;
     _rightOptionWaitingForRelease = YES;
+    _focusBounceComplete = NO;
     _voiceTrigger = VoiceTrigger::RightOption;
+    [self showStatus];
     _stateItem.title = @"正在激活豆包语音…";
     return YES;
 }
 
+- (void)clearSavedFocus {
+    _frontmostApp = nil;
+    if (_focusedWindow) CFRelease(_focusedWindow);
+    _focusedWindow = nullptr;
+}
+
+- (void)sendRightOptionTap {
+    if (!_rightOptionPending) return;
+    postRightOptionEvent(true);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRightOptionTapDuration * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        postRightOptionEvent(false);
+        if (!self->_rightOptionPending) return;
+        NSLog(@"豆包已激活，已补发右 Option 点按");
+        self->_rightOptionPending = NO;
+        self->_stateItem.title = [NSString stringWithFormat:@"语音输入中 · 将返回 %@", sourceName(self->_previous)];
+        [self clearSavedFocus];
+    });
+}
+
+- (void)bounceFocusAndTriggerRightOption {
+    if (!_rightOptionPending) return;
+    NSRunningApplication *original = _frontmostApp;
+    NSRunningApplication *neutral = [NSRunningApplication currentApplication];
+    BOOL bounced = neutral && neutral.processIdentifier != original.processIdentifier && [neutral activateWithOptions:0];
+    NSLog(@"豆包输入法已选中；焦点回弹=%d，原应用=%@", bounced, original.bundleIdentifier);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kFocusBounceDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!self->_rightOptionPending) return;
+        [original activateWithOptions:0];
+        if (self->_focusedWindow) {
+            AXUIElementSetAttributeValue(self->_focusedWindow, kAXMainAttribute, kCFBooleanTrue);
+            AXUIElementSetAttributeValue(self->_focusedWindow, kAXFocusedAttribute, kCFBooleanTrue);
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kFocusSettleDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!self->_rightOptionPending) return;
+            self->_focusBounceComplete = YES;
+            TISInputSourceRef current = TISCopyCurrentKeyboardInputSource();
+            BOOL stillDoubao = current && [sourceID(current) isEqualToString:kDoubaoSourceID];
+            if (current) CFRelease(current);
+            if (stillDoubao) [self sendRightOptionTap];
+            else [self advanceToDoubao:4];
+        });
+    });
+}
+
 - (void)advanceToDoubao:(NSUInteger)remaining {
     if (!_rightOptionPending) return;
+    if (remaining == 8 && _frontmostApp) {
+        AXUIElementRef application = AXUIElementCreateApplication(_frontmostApp.processIdentifier);
+        CFTypeRef window = nullptr;
+        if (AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute, &window) == kAXErrorSuccess) {
+            _focusedWindow = (AXUIElementRef)window;
+        }
+        CFRelease(application);
+    }
     TISInputSourceRef current = TISCopyCurrentKeyboardInputSource();
     BOOL selected = current && [sourceID(current) isEqualToString:kDoubaoSourceID];
     if (current) CFRelease(current);
     if (selected) {
         _switched = YES;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (!self->_rightOptionPending) return;
-            postRightOptionTap();
-            NSLog(@"豆包已通过系统快捷键激活，已补发右 Option 点按");
-            self->_rightOptionPending = NO;
-            self->_stateItem.title = [NSString stringWithFormat:@"语音输入中 · 将返回 %@", sourceName(self->_previous)];
-        });
+        if (_focusBounceComplete) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [self sendRightOptionTap]; });
+        } else {
+            [self bounceFocusAndTriggerRightOption];
+        }
         return;
     }
     if (remaining == 0) {
@@ -346,18 +472,22 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
         if (_previous) TISSelectInputSource(_previous);
         if (_previous) CFRelease(_previous);
         _previous = nullptr;
+        _switched = NO;
+        [self clearSavedFocus];
         _stateItem.title = @"无法激活豆包，请检查输入法切换快捷键";
         return;
     }
-    postNextInputSourceShortcut();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [self advanceToDoubao:remaining - 1]; });
+    postNextInputSourceShortcut(^ {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self advanceToDoubao:remaining - 1]; });
+    });
 }
 
 - (void)stopVoice {
     if (!_switched) return;
     [_restoreTimer invalidate];
     _stateItem.title = @"等待豆包提交语音结果…";
+    [self scheduleStatusHide];
     _restoreTimer = [NSTimer scheduledTimerWithTimeInterval:_restoreDelay
                                                     target:self
                                                   selector:@selector(restoreInputSource)
@@ -389,6 +519,7 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
 
 - (void)quit:(id)sender {
     (void)sender;
+    [_statusHideTimer invalidate];
     [_restoreTimer invalidate];
     _chordDown = NO;
     _rightOptionPending = NO;
@@ -399,6 +530,7 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
+    [_statusHideTimer invalidate];
     if (_tapSource) {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), _tapSource, kCFRunLoopCommonModes);
         CFRelease(_tapSource);
@@ -408,6 +540,7 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     if (_nativeChinese) CFRelease(_nativeChinese);
     if (_nativeEnglish) CFRelease(_nativeEnglish);
     if (_previous) CFRelease(_previous);
+    [self clearSavedFocus];
 }
 @end
 

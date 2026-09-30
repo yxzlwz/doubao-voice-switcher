@@ -50,5 +50,5 @@ if ! launchctl bootstrap "gui/$(id -u)" "$agent_file"; then
   launchctl bootstrap "gui/$(id -u)" "$agent_file"
 fi
 print "已安装并启动：$app_dir"
-print '请在菜单栏找到圆形语音图标；首次使用请检查“输入监控”和“辅助功能”两项权限；程序不会自动重复弹窗。'
+print '圆形语音图标平时隐藏，启动语音时显示；首次使用请检查“输入监控”和“辅助功能”两项权限；程序不会自动重复弹窗。'
 print '要让单按 Fn 仅切系统中英文，请手动将系统“按下 Fn 键时”设为“不执行任何操作”。'
