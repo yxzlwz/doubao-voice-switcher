@@ -101,6 +101,12 @@ static void postRightOptionEvent(bool down) {
     if (source) CFRelease(source);
 }
 
+static void postRightOptionTap(void) {
+    postRightOptionEvent(true);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRightOptionTapDuration * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ postRightOptionEvent(false); });
+}
+
 @interface VoiceSwitcher : NSObject <NSApplicationDelegate>
 @end
 
@@ -124,30 +130,44 @@ static void postRightOptionEvent(bool down) {
     BOOL _chordDown;
     VoiceTrigger _voiceTrigger;
     BOOL _rightOptionPending;
-    BOOL _rightOptionWaitingForRelease;
+    CGEventRef _rightOptionPressEvent;
     BOOL _focusBounceComplete;
     BOOL _switched;
     NSRunningApplication *_frontmostApp;
     AXUIElementRef _focusedWindow;
 }
 
-static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef event, void *context) {
+static CGEventRef handleEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context) {
     VoiceSwitcher *self = (__bridge VoiceSwitcher *)context;
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        if (self->_rightOptionPressEvent) {
+            CFRelease(self->_rightOptionPressEvent);
+            self->_rightOptionPressEvent = nullptr;
+        }
         if (self->_tap) CGEventTapEnable(self->_tap, true);
         return event;
     }
-    if (type == kCGEventKeyDown) {
-        if (self->_fnDown) self->_fnCandidate = NO;
+    if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kSyntheticRightOptionTag) return event;
+    BOOL rightOptionEvent = type == kCGEventFlagsChanged &&
+                           CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == kVK_RightOption;
+    if (self->_rightOptionPressEvent && !rightOptionEvent &&
+        (type == kCGEventKeyDown || type == kCGEventKeyUp || type == kCGEventFlagsChanged)) {
+        // A combination cancels the tap. Deliver the deferred modifier press
+        // before the other key so Option shortcuts keep their normal behavior.
+        CGEventSetIntegerValueField(self->_rightOptionPressEvent, kCGEventSourceUserData, kSyntheticRightOptionTag);
+        CGEventTapPostEvent(proxy, self->_rightOptionPressEvent);
+        CFRelease(self->_rightOptionPressEvent);
+        self->_rightOptionPressEvent = nullptr;
+    }
+    if (type == kCGEventKeyDown || type == kCGEventKeyUp) {
+        if (type == kCGEventKeyDown && self->_fnDown) self->_fnCandidate = NO;
         return event;
     }
     if (type != kCGEventFlagsChanged) return event;
-    if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kSyntheticRightOptionTag) return event;
     CGEventFlags flags = CGEventGetFlags(event);
     BOOL fn = (flags & kCGEventFlagMaskSecondaryFn) != 0;
     BOOL control = (flags & kCGEventFlagMaskControl) != 0;
     BOOL chord = control && fn;
-    BOOL rightOptionEvent = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == kVK_RightOption;
     BOOL rightOptionDown = rightOptionEvent && (flags & NX_DEVICERALTKEYMASK);
     if (fn && !self->_fnDown) {
         self->_fnDown = YES;
@@ -169,20 +189,38 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
         [self stopVoice];
     }
     self->_chordDown = chord;
-    if (rightOptionEvent && self->_rightOptionPending) {
-        if (!rightOptionDown && self->_rightOptionWaitingForRelease) {
-            self->_rightOptionWaitingForRelease = NO;
-            dispatch_async(dispatch_get_main_queue(), ^{ [self advanceToDoubao:8]; });
+    if (rightOptionDown) {
+        CGEventFlags otherModifiers = kCGEventFlagMaskControl | kCGEventFlagMaskShift |
+                                      kCGEventFlagMaskCommand | kCGEventFlagMaskSecondaryFn | NX_DEVICELALTKEYMASK;
+        BOOL otherKeyDown = NO;
+        for (CGKeyCode key = 0; key < 128; ++key) {
+            if (key != kVK_RightOption && CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, key)) {
+                otherKeyDown = YES;
+                break;
+            }
+        }
+        if (!(flags & otherModifiers) && !otherKeyDown) {
+            if (!self->_rightOptionPressEvent) self->_rightOptionPressEvent = CGEventCreateCopy(event);
+            if (self->_rightOptionPressEvent) return nullptr;
+        }
+    } else if (rightOptionEvent && self->_rightOptionPressEvent) {
+        CFRelease(self->_rightOptionPressEvent);
+        self->_rightOptionPressEvent = nullptr;
+        // Only a standalone release may switch input sources or toggle voice.
+        if (!self->_rightOptionPending) {
+            if (self->_voiceTrigger == VoiceTrigger::RightOption) {
+                postRightOptionTap();
+                self->_voiceTrigger = VoiceTrigger::None;
+                [self stopVoice];
+            } else if (self->_voiceTrigger == VoiceTrigger::None) {
+                if ([self prepareRightOptionVoice]) {
+                    dispatch_async(dispatch_get_main_queue(), ^{ [self advanceToDoubao:8]; });
+                } else {
+                    postRightOptionTap();
+                }
+            }
         }
         return nullptr;
-    }
-    if (rightOptionDown && !chord) {
-        if (self->_voiceTrigger == VoiceTrigger::RightOption) {
-            self->_voiceTrigger = VoiceTrigger::None;
-            [self stopVoice];
-        } else if (self->_voiceTrigger == VoiceTrigger::None) {
-            if ([self prepareRightOptionVoice]) return nullptr;
-        }
     }
     if (switchedNow) {
         // Keep the original hardware event in the event tap until Doubao is active.
@@ -283,7 +321,8 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     }
     _tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
                             kCGEventTapOptionDefault,
-                            CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown),
+                            CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown) |
+                            CGEventMaskBit(kCGEventKeyUp),
                             handleEvent, (__bridge void *)self);
     if (!_tap) {
         _stateItem.title = @"键盘监听未获权限，点击重试";
@@ -387,7 +426,6 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
     if (_focusedWindow) CFRelease(_focusedWindow);
     _focusedWindow = nullptr;
     _rightOptionPending = YES;
-    _rightOptionWaitingForRelease = YES;
     _focusBounceComplete = NO;
     _voiceTrigger = VoiceTrigger::RightOption;
     [self showStatus];
@@ -536,6 +574,7 @@ static CGEventRef handleEvent(CGEventTapProxy, CGEventType type, CGEventRef even
         CFRelease(_tapSource);
     }
     if (_tap) CFRelease(_tap);
+    if (_rightOptionPressEvent) CFRelease(_rightOptionPressEvent);
     if (_doubao) CFRelease(_doubao);
     if (_nativeChinese) CFRelease(_nativeChinese);
     if (_nativeEnglish) CFRelease(_nativeEnglish);
